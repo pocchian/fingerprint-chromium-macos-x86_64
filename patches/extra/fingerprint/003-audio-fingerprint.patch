@@ -1,0 +1,100 @@
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+index aed92e0..0aa6672 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -25,9 +25,11 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_context.h"
+ 
++#include "base/command_line.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "media/base/audio_glitch_info.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_offline_audio_context_options.h"
+@@ -173,6 +175,65 @@ OfflineAudioContext* OfflineAudioContext::Create(
+                                    render_quantum_frames, exception_state);
+ }
+ 
++namespace {
++
++// Deterministic per-sample noise for --fingerprint. This replaces the old
++// ±0.01 Hz sample-rate noise, which float32 rounded to ~7 values (one of them
++// no noise at all) and which also changed buffer.sampleRate. Each sample is
++// scaled by 1 ± (0.5..1.0)e-6, derived from the seed and sample index, so the
++// factor is never exactly 1. Samples equal to their original neighbour (flat
++// runs: constant sources, DC offsets, silence, square-wave plateaus) are left
++// exact, and the channel isn't part of the key, so identical channels stay
++// identical.
++void ApplyFingerprintAudioNoise(AudioBuffer* buffer) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kFingerprint)) {
++    return;
++  }
++  if (command_line->HasSwitch(switches::kDisableSpoofing) &&
++      command_line->GetSwitchValueASCII(switches::kDisableSpoofing)
++              .find("audio") != std::string::npos) {
++    return;
++  }
++  const std::string fingerprint_str =
++      command_line->GetSwitchValueASCII(switches::kFingerprint);
++  if (fingerprint_str.empty()) {
++    return;
++  }
++
++  const uint64_t key = std::hash<std::string>{}(fingerprint_str + "audio-samples");
++  for (unsigned channel = 0; channel < buffer->numberOfChannels(); ++channel) {
++    DOMFloat32Array* data = buffer->getChannelData(channel).Get();
++    if (!data) {
++      continue;
++    }
++    base::span<float> samples = data->AsSpan();
++    const size_t count = samples.size();
++    float previous = 0.0f;  // original (un-noised) value of samples[i - 1]
++    for (size_t i = 0; i < count; ++i) {
++      const float original = samples[i];
++      const bool flat = (i > 0 && original == previous) ||
++                        (i + 1 < count && original == samples[i + 1]);
++      previous = original;
++      if (flat) {
++        continue;
++      }
++      // splitmix64 over (key, index)
++      uint64_t z = key ^ i;
++      z += 0x9e3779b97f4a7c15ULL;
++      z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++      z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++      z ^= z >> 31;
++      const double magnitude =
++          0.5 + (static_cast<double>(z >> 11) / 9007199254740992.0) * 0.5;
++      const double factor = 1.0 + ((z & 1) ? magnitude : -magnitude) * 1e-6;
++      samples[i] = static_cast<float>(original * factor);
++    }
++  }
++}
++
++}  // namespace
++
+ OfflineAudioContext::OfflineAudioContext(LocalDOMWindow* window,
+                                          unsigned number_of_channels,
+                                          uint32_t number_of_frames,
+@@ -184,7 +245,7 @@ OfflineAudioContext::OfflineAudioContext(LocalDOMWindow* window,
+                        render_quantum_frames),
+       total_render_frames_(number_of_frames) {
+   destination_node_ = OfflineAudioDestinationNode::Create(
+-      this, number_of_channels, number_of_frames, sample_rate);
++      this, number_of_channels, total_render_frames_, sample_rate);
+   Initialize();
+ }
+ 
+@@ -432,6 +493,8 @@ void OfflineAudioContext::FireCompletionEvent() {
+       return;
+     }
+ 
++    ApplyFingerprintAudioNoise(rendered_buffer);
++
+     // Call the offline rendering completion event listener and resolve the
+     // promise too.
+     DispatchEvent(*OfflineAudioCompletionEvent::Create(rendered_buffer));

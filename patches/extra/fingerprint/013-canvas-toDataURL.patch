@@ -1,0 +1,71 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index d1193b6..41ce017 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -33,6 +33,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -42,6 +43,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "build/build_config.h"
+ #include "cc/layers/texture_layer.h"
+ #include "cc/trees/layer_tree_host.h"
+@@ -1287,6 +1289,50 @@ String HTMLCanvasElement::ToDataURLInternal(
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
++
++    // Fingerprint canvas noise: encode from a noised copy of the snapshot. The
++    // copy is only made for 8-bit sources and keeps the colour space (JPEG and
++    // WebP embed it as an ICC profile) and opaque alpha; anything else, or any
++    // failure, encodes the original snapshot unmodified.
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    if (command_line->HasSwitch(switches::kFingerprint) &&
++        (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++         command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
++      PaintImage original_paint_image = image_bitmap->PaintImageForCurrentFrame();
++      const SkImageInfo src_info = original_paint_image.GetSkImageInfo();
++      if (src_info.colorType() == kRGBA_8888_SkColorType ||
++          src_info.colorType() == kBGRA_8888_SkColorType) {
++        const SkImageInfo image_info =
++            src_info.makeColorType(kRGBA_8888_SkColorType)
++                .makeAlphaType(src_info.alphaType() == kOpaque_SkAlphaType
++                                   ? kOpaque_SkAlphaType
++                                   : kUnpremul_SkAlphaType);
++        const size_t row_bytes = image_info.minRowBytes();
++        const size_t buffer_size = image_info.computeMinByteSize();
++        if (buffer_size > 0 && !SkImageInfo::ByteSizeOverflowed(buffer_size) &&
++            buffer_size <= partition_alloc::MaxDirectMapped()) {
++          sk_sp<SkData> pixel_data = SkData::MakeUninitialized(buffer_size);
++          if (pixel_data &&
++              original_paint_image.readPixels(image_info,
++                                              pixel_data->writable_data(),
++                                              row_bytes, 0, 0)) {
++            StaticBitmapImage::ShuffleSubchannelColorData(
++                pixel_data->writable_data(), image_info, 0, 0);
++            sk_sp<SkImage> modified_sk_image = SkImages::RasterFromData(
++                image_info, std::move(pixel_data), row_bytes);
++            if (modified_sk_image) {
++              PaintImage modified_paint_image = PaintImageBuilder::WithDefault()
++                  .set_id(PaintImage::GetNextId())
++                  .set_image(modified_sk_image, PaintImage::GetNextContentId())
++                  .TakePaintImage();
++              image_bitmap = StaticBitmapImage::Create(
++                  modified_paint_image, image_bitmap->Orientation());
++            }
++          }
++        }
++      }
++    }
++
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+     if (!data_buffer)

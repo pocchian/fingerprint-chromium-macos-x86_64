@@ -1,0 +1,88 @@
+diff --git a/third_party/blink/common/device_memory/approximated_device_memory.cc b/third_party/blink/common/device_memory/approximated_device_memory.cc
+index 7fd53eb..16b2d4d 100644
+--- a/third_party/blink/common/device_memory/approximated_device_memory.cc
++++ b/third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -6,7 +6,9 @@
+ 
+ #include "base/byte_size.h"
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/feature_list.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/system/sys_info.h"
+ #include "third_party/blink/public/common/features.h"
+ 
+@@ -23,6 +25,28 @@ void ApproximatedDeviceMemory::Initialize() {
+   DCHECK_EQ(0, physical_memory_mb_);
+   physical_memory_mb_ = ::base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
+   CalculateAndSetApproximatedDeviceMemory();
++
++  // Fingerprint profiles report one value everywhere: navigator.deviceMemory
++  // and the Device-Memory client hints (browser and renderer both call this).
++  // The switch names are literals because blink/common can't depend on
++  // //components; see components/ungoogled/ungoogled_switches.cc.
++  if (!base::CommandLine::InitializedForCurrentProcess()) {
++    return;
++  }
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch("fingerprint")) {
++    return;
++  }
++  int memory_gb = 0;
++  if (!base::StringToInt(
++          command_line->GetSwitchValueASCII("fingerprint-device-memory"),
++          &memory_gb) ||
++      (memory_gb != 2 && memory_gb != 4 && memory_gb != 8 && memory_gb != 16 &&
++       memory_gb != 32)) {
++    memory_gb = 8;
++  }
++  approximated_device_memory_gb_ = static_cast<float>(memory_gb);
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2..7a97c15 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -4,11 +4,40 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
++#include <functional>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/system/sys_info.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++
++  // Invalid or out-of-range values are treated as if the switch were absent
++  // (std::stoul would abort the renderer on non-numeric input).
++  unsigned custom_concurrency = 0;
++  if (command_line->HasSwitch(switches::kFingerprintHardwareConcurrency) &&
++      base::StringToUint(command_line->GetSwitchValueASCII(
++                             switches::kFingerprintHardwareConcurrency),
++                         &custom_concurrency) &&
++      custom_concurrency >= 1 && custom_concurrency <= 256) {
++    return custom_concurrency;
++  }
++
++  if (command_line->HasSwitch(switches::kFingerprint)) {
++    std::string fingerprint_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
++    uint64_t parsed = 0;
++    uint32_t fingerprint =
++        base::StringToUint64(fingerprint_str, &parsed)
++            ? static_cast<uint32_t>(parsed)
++            : static_cast<uint32_t>(std::hash<std::string>{}(fingerprint_str));
++    return static_cast<unsigned>(((fingerprint % 13) + 4) * 2);
++  }
++
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+ 

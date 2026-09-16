@@ -1,0 +1,118 @@
+diff --git a/components/ungoogled/fingerprint_data.h b/components/ungoogled/fingerprint_data.h
+index f59184e..74fda2d 100644
+--- a/components/ungoogled/fingerprint_data.h
++++ b/components/ungoogled/fingerprint_data.h
+@@ -62,9 +62,10 @@ constexpr const char* kMacOSPlatform = "macOS";
+ // Platform version arrays (most common first, for seed-based selection)
+ constexpr const char* kWindowsVersions[] = {"19.0.0", "15.0.0"};
+ constexpr const char* kLinuxVersions[] = {"6.14.0", "6.8.0"};
++// macOS releases from Apple's gdmf.apple.com/v2/pmv (2026-09-15), most common first.
+ constexpr const char* kMacOSVersions[] = {
+-    "15.5.0", "15.4.1", "15.4.0", "15.3.2", "15.3.1",
+-    "15.3.0", "15.2.0", "15.1.1", "15.1.0", "15.0.1"
++    "26.6.2", "26.6.1", "26.6.0", "26.5.2", "26.5.1",
++    "26.7.0", "15.7.9", "15.8.0", "27.0.0"
+ };
+ 
+ // Default architectures
+@@ -95,7 +96,11 @@ constexpr const char* kMacosGpuModels[] = {
+     "M3 Pro",
+     "M4",
+     "M4 Max",
+-    "M4 Pro"
++    "M4 Pro",
++    "A18 Pro",
++    "M5",
++    "M5 Pro",
++    "M5 Max"
+ };
+ 
+ constexpr size_t kMacosGpuModelCount = sizeof(kMacosGpuModels) / sizeof(kMacosGpuModels[0]);
+diff --git a/components/ungoogled/ungoogled_switches.cc b/components/ungoogled/ungoogled_switches.cc
+index 49f325e..f88df9a 100644
+--- a/components/ungoogled/ungoogled_switches.cc
++++ b/components/ungoogled/ungoogled_switches.cc
+@@ -39,6 +39,9 @@ const char kFingerprintDeviceScaleFactor[] = "fingerprint-device-scale-factor";
+ // Specify the number of CPU cores
+ const char kFingerprintHardwareConcurrency[] = "fingerprint-hardware-concurrency";
+ 
++// Specify the GPU model reported on macOS, e.g. "M5" or "A18 Pro"
++const char kFingerprintGpuModel[] = "fingerprint-gpu-model";
++
+ // Specify the operating system type
+ const char kFingerprintPlatform[] = "fingerprint-platform";
+ 
+diff --git a/components/ungoogled/ungoogled_switches.h b/components/ungoogled/ungoogled_switches.h
+index 2ec06c3..6cdc329 100644
+--- a/components/ungoogled/ungoogled_switches.h
++++ b/components/ungoogled/ungoogled_switches.h
+@@ -23,6 +23,7 @@ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintScreenWidth[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintScreenHeight[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintDeviceScaleFactor[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintHardwareConcurrency[];
++COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintGpuModel[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintPlatform[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintPlatformVersion[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintLocation[];
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 3110987..ed43ede 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3910,6 +3910,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       switches::kFingerprintScreenHeight,
+       switches::kFingerprintDeviceScaleFactor,
+       switches::kFingerprintHardwareConcurrency,
++      switches::kFingerprintGpuModel,
+       switches::kFingerprintPlatform,
+       switches::kFingerprintPlatformVersion,
+       switches::kFingerprintLocation,
+diff --git a/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc b/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc
+index b3f2e51..4d07a8c 100644
+--- a/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc
++++ b/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc
+@@ -49,6 +49,29 @@ std::string GetGLRendererString(const std::string& platform, uint32_t fingerprin
+   }
+ }
+ 
++// Returns the chip name from --fingerprint-gpu-model (e.g. "M5", "A18 Pro"),
++// or "" if the switch is unset or the value isn't a plain model name.
++std::string GetMacosGpuModelOverride(const base::CommandLine& command_line) {
++  if (!command_line.HasSwitch(switches::kFingerprintGpuModel)) {
++    return "";
++  }
++  std::string model(base::TrimWhitespaceASCII(
++      command_line.GetSwitchValueASCII(switches::kFingerprintGpuModel),
++      base::TRIM_ALL));
++  if (base::StartsWith(model, "Apple ")) {
++    model = model.substr(6);
++  }
++  if (model.empty() || model.size() > 24) {
++    return "";
++  }
++  for (char c : model) {
++    if (!base::IsAsciiAlphaNumeric(c) && c != ' ') {
++      return "";
++    }
++  }
++  return model;
++}
++
+ }  // namespace
+ 
+ // Public functions that will be used in WebGL code
+@@ -93,6 +116,15 @@ std::string GetGLRendererStringForFingerprint() {
+           command_line->GetSwitchValueASCII(switches::kFingerprintPlatform));
+     }
+ 
++    if (platform == "macos") {
++      std::string model = GetMacosGpuModelOverride(*command_line);
++      if (!model.empty()) {
++        // Same format as GetMacosGpuString() in gpu_info.cc
++        return "ANGLE (Apple, ANGLE Metal Renderer: Apple " + model +
++               ", Unspecified Version)";
++      }
++    }
++
+     std::string fingerprint_str =
+         command_line->GetSwitchValueASCII(switches::kFingerprint);
+     base::StringToUint(fingerprint_str, &fingerprint);

@@ -1,0 +1,101 @@
+diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
+index 368f77b..361f4f6 100644
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -32,9 +32,11 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/containers/adapters.h"
+ #include "base/feature_list.h"
+ #include "cc/input/snap_selection_strategy.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/mojom/scroll/scroll_enums.mojom-blink.h"
+@@ -3348,6 +3350,28 @@ void Element::ClientQuads(Vector<gfx::QuadF>& quads) const {
+   }
+ }
+ 
++bool Element::ShouldSkipClientRectsOffset() const {
++  if (!GetLayoutObject() || !GetLayoutObject()->Style()) {
++    return false;
++  }
++
++  const ComputedStyle& style = *GetLayoutObject()->Style();
++
++  // 检查是否为绝对定位
++  if (style.GetPosition() != EPosition::kAbsolute) {
++    return false;
++  }
++
++  // 检查top和left是否都是"确定的"值（Zero或Fixed）
++  const Length& top = style.Top();
++  const Length& left = style.Left();
++
++  bool top_is_deterministic = top.IsZero() || top.IsFixed();
++  bool left_is_deterministic = left.IsZero() || left.IsFixed();
++
++  return (top_is_deterministic && left_is_deterministic);
++}
++
+ DOMRectList* Element::getClientRects() {
+   Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
+   if (rects.empty()) {
+diff --git a/third_party/blink/renderer/core/dom/element.h b/third_party/blink/renderer/core/dom/element.h
+index 7c1dcdf..baa0611 100644
+--- a/third_party/blink/renderer/core/dom/element.h
++++ b/third_party/blink/renderer/core/dom/element.h
+@@ -633,6 +633,8 @@ class CORE_EXPORT Element : public ContainerNode {
+   // TODO(crbug.com/41417572): This method should replace the above method.
+   gfx::Rect VisibleBoundsRespectingClipsInLocalRoot() const;
+ 
++  bool ShouldSkipClientRectsOffset() const;
++
+   DOMRectList* getClientRects();
+   // Returns a list of clients Rects in zoomed pixel units.
+   Vector<gfx::RectF> GetClientRectsNoAdjustment();
+diff --git a/ui/gfx/geometry/quad_f.cc b/ui/gfx/geometry/quad_f.cc
+index b6306c2..da400b4 100644
+--- a/ui/gfx/geometry/quad_f.cc
++++ b/ui/gfx/geometry/quad_f.cc
+@@ -137,6 +137,22 @@ void QuadF::Scale(float x_scale, float y_scale) {
+   p4_.Scale(x_scale, y_scale);
+ }
+ 
++void QuadF::Offset(float x_offset, float y_offset) {
++  // 计算轴对齐边界框的宽高
++  const auto [min, max] = Extents();
++  float width = max.x() - min.x();
++  float height = max.y() - min.y();
++
++  if (WithinEpsilon(width, 0.0f) || WithinEpsilon(height, 0.0f)) {
++    return;
++  }
++
++  p1_.Offset(x_offset, y_offset);
++  p2_.Offset(x_offset, y_offset);
++  p3_.Offset(x_offset, y_offset);
++  p4_.Offset(x_offset, y_offset);
++}
++
+ void QuadF::operator+=(const Vector2dF& rhs) {
+   p1_ += rhs;
+   p2_ += rhs;
+diff --git a/ui/gfx/geometry/quad_f.h b/ui/gfx/geometry/quad_f.h
+index c9d21e3..7742aaf 100644
+--- a/ui/gfx/geometry/quad_f.h
++++ b/ui/gfx/geometry/quad_f.h
+@@ -106,6 +106,11 @@ class COMPONENT_EXPORT(GEOMETRY) QuadF {
+   // Scale each point in the quad by the scale factors along each axis.
+   void Scale(float x_scale, float y_scale);
+ 
++  // Offset each point in the quad by the offset values.
++  void Offset(float offset) { Offset(offset, offset); }
++  // Offset each point in the quad by the offset values along each axis.
++  void Offset(float x_offset, float y_offset);
++
+   // Tests whether any part of the rectangle intersects with this quad.
+   // This only works for convex quads.
+   // This intersection is edge-inclusive and will return true even if the

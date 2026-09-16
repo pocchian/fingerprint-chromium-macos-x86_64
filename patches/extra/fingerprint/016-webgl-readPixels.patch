@@ -1,0 +1,105 @@
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index d362112..f20eabe 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -25,13 +25,16 @@
+ 
+ #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
+ 
++#include <algorithm>
+ #include <inttypes.h>
+ 
+ #include <memory>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/bit_cast.h"
+ #include "base/byte_size.h"
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/feature_list.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -45,6 +48,7 @@
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "device/vr/buildflags/buildflags.h"
+@@ -151,6 +155,7 @@
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_record_builder.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/sk_image_info_hash.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/skia_utils.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_transform.h"
+ #include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/video_frame_image_util.h"
+@@ -5368,6 +5373,67 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+       return;
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
++
++    // Fingerprint canvas noise for readPixels. Only RGBA/UNSIGNED_BYTE reads
++    // whose row stride is exactly 4 * width are touched (other formats use 1-2
++    // bytes or 16-bit components per pixel). The noise runs on a tight copy of
++    // the part of the read that overlaps the framebuffer. On the default
++    // framebuffer the copy is top-down and keyed by canvas coordinates, so it
++    // matches the 2D noise of the same pixels. Texture-backed framebuffers are
++    // skipped because their size isn't tracked.
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    if (format == GL_RGBA && type == GL_UNSIGNED_BYTE && data && width > 0 &&
++        height > 0 && pack_alignment_ > 0 &&
++        (4 * static_cast<int64_t>(width)) % pack_alignment_ == 0 &&
++        command_line->HasSwitch(switches::kFingerprint) &&
++        (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++         command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
++      int64_t fb_width = -1;
++      int64_t fb_height = -1;
++      if (!framebuffer) {
++        fb_width = drawingBufferWidth();
++        fb_height = drawingBufferHeight();
++      } else if (WebGLObject* attachment = framebuffer->GetAttachmentObject(
++                     framebuffer->GetReadBuffer());
++                 attachment && attachment->IsRenderbuffer()) {
++        auto* renderbuffer = static_cast<WebGLRenderbuffer*>(attachment);
++        fb_width = renderbuffer->Width();
++        fb_height = renderbuffer->Height();
++      }
++      const int64_t x0 = std::max<int64_t>(x, 0);
++      const int64_t y0 = std::max<int64_t>(y, 0);
++      const int64_t ow =
++          std::min<int64_t>(static_cast<int64_t>(x) + width, fb_width) - x0;
++      const int64_t oh =
++          std::min<int64_t>(static_cast<int64_t>(y) + height, fb_height) - y0;
++      if (fb_width > 0 && fb_height > 0 && ow >= 8 && oh >= 8) {
++        const bool flip = !framebuffer;
++        const size_t src_stride = 4 * static_cast<size_t>(width);
++        const size_t dst_stride = 4 * static_cast<size_t>(ow);
++        const size_t src_col = 4 * static_cast<size_t>(x0 - x);
++        std::vector<uint8_t> overlap(dst_stride * static_cast<size_t>(oh));
++        for (int64_t r = 0; r < oh; ++r) {
++          const int64_t gl_row = flip ? y0 + oh - 1 - r : y0 + r;
++          std::copy_n(data + static_cast<size_t>(gl_row - y) * src_stride +
++                          src_col,
++                      dst_stride,
++                      overlap.data() + static_cast<size_t>(r) * dst_stride);
++        }
++        const SkImageInfo overlap_info = SkImageInfo::Make(
++            static_cast<int>(ow), static_cast<int>(oh), kRGBA_8888_SkColorType,
++            kUnpremul_SkAlphaType);
++        StaticBitmapImage::ShuffleSubchannelColorData(
++            overlap.data(), overlap_info, static_cast<int>(x0),
++            static_cast<int>(flip ? fb_height - y0 - oh : y0));
++        for (int64_t r = 0; r < oh; ++r) {
++          const int64_t gl_row = flip ? y0 + oh - 1 - r : y0 + r;
++          std::copy_n(overlap.data() + static_cast<size_t>(r) * dst_stride,
++                      dst_stride,
++                      data + static_cast<size_t>(gl_row - y) * src_stride +
++                          src_col);
++        }
++      }
++    }
+   }
+ }
+ 

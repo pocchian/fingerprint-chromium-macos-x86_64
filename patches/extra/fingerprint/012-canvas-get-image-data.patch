@@ -1,0 +1,417 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+index adb616d..5a7e7c0 100644
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -4,10 +4,13 @@
+ 
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ 
++#include "base/command_line.h"
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/ungoogled_switches.h"
++#include "partition_alloc/partition_alloc_constants.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -18,6 +21,7 @@
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+ #include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/skia_utils.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
+@@ -32,6 +36,8 @@
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
++#include "third_party/skia/include/core/SkData.h"
++#include "third_party/skia/include/core/SkImage.h"
+ #include "third_party/skia/include/core/SkSurface.h"
+ #include "third_party/skia/include/encode/SkPngRustEncoder.h"
+ 
+@@ -135,6 +141,53 @@ void RecordScaledDurationHistogram(ImageEncodingMimeType mime_type,
+   }
+ }
+ 
++// Fingerprint canvas noise for toBlob/convertToBlob: returns a noised copy of
++// |image|, made the same way as in HTMLCanvasElement::ToDataURLInternal (8-bit
++// sources only, colour space and opaque alpha kept). Returns |image| unchanged
++// when noise is off, for other colour types, or on any failure.
++scoped_refptr<StaticBitmapImage> MaybeApplyFingerprintCanvasNoise(
++    scoped_refptr<StaticBitmapImage> image) {
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kFingerprint) ||
++      (command_line->HasSwitch(switches::kDisableSpoofing) &&
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing)
++               .find("canvas") != std::string::npos)) {
++    return image;
++  }
++  PaintImage paint_image = image->PaintImageForCurrentFrame();
++  const SkImageInfo src_info = paint_image.GetSkImageInfo();
++  if (src_info.colorType() != kRGBA_8888_SkColorType &&
++      src_info.colorType() != kBGRA_8888_SkColorType) {
++    return image;
++  }
++  const SkImageInfo info =
++      src_info.makeColorType(kRGBA_8888_SkColorType)
++          .makeAlphaType(src_info.alphaType() == kOpaque_SkAlphaType
++                             ? kOpaque_SkAlphaType
++                             : kUnpremul_SkAlphaType);
++  const size_t row_bytes = info.minRowBytes();
++  const size_t size = info.computeMinByteSize();
++  if (size == 0 || SkImageInfo::ByteSizeOverflowed(size) ||
++      size > partition_alloc::MaxDirectMapped()) {
++    return image;
++  }
++  sk_sp<SkData> data = SkData::MakeUninitialized(size);
++  if (!data ||
++      !paint_image.readPixels(info, data->writable_data(), row_bytes, 0, 0)) {
++    return image;
++  }
++  StaticBitmapImage::ShuffleSubchannelColorData(data->writable_data(), info, 0,
++                                                0);
++  sk_sp<SkImage> noised =
++      SkImages::RasterFromData(info, std::move(data), row_bytes);
++  if (!noised) {
++    return image;
++  }
++  return UnacceleratedStaticBitmapImage::Create(std::move(noised),
++                                                image->Orientation());
++}
++
+ }  // anonymous namespace
+ 
+ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+@@ -180,6 +233,9 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+   image_ = image->MakeUnaccelerated();
+ 
+   if (image_) {
++    // Replace the image before |skia_image_| is derived from it, so the lazy
++    // decode, peekPixels and every encoder see the noised copy.
++    image_ = MaybeApplyFingerprintCanvasNoise(std::move(image_));
+     skia_image_ = image_->PaintImageForCurrentFrame().GetSwSkImage();
+     CHECK(skia_image_);
+     CHECK(!skia_image_->isTextureBacked());
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 1761fa3..cebf63f 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "base/check.h"
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/location.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -27,6 +28,7 @@
+ #include "cc/paint/paint_flags.h"
+ #include "cc/paint/paint_image.h"
+ #include "cc/paint/record_paint_canvas.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
+ #include "third_party/blink/public/common/metrics/document_update_reason.h"
+@@ -517,8 +519,25 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
+     }
+-    if (read_pixels_successful && RuntimeEnabledFeatures::FingerprintingCanvasImageDataNoiseEnabled()) {
+-      StaticBitmapImage::ShuffleSubchannelColorData(image_data_pixmap.addr(), image_data_pixmap.info(), sx, sy);
++
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    if (read_pixels_successful && command_line->HasSwitch(switches::kFingerprint) &&
++        (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++         command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
++      // Noise the whole ImageData keyed by its canvas offset. Out-of-canvas
++      // pixels are zero-initialized (alpha 0), which the noise treats like the
++      // canvas edge, so an oversized read matches a full read. Only 8-bit
++      // canvases are noised, the same set as toDataURL/toBlob.
++      const SkColorType snapshot_color_type =
++          snapshot->PaintImageForCurrentFrame().GetSkImageInfo().colorType();
++      gfx::Rect overlap = image_data_rect;
++      overlap.Intersect(snapshot_rect);
++      if ((snapshot_color_type == kRGBA_8888_SkColorType ||
++           snapshot_color_type == kBGRA_8888_SkColorType) &&
++          overlap.width() >= 8 && overlap.height() >= 8) {
++        StaticBitmapImage::ShuffleSubchannelColorData(
++            image_data_pixmap.addr(), image_data_pixmap.info(), sx, sy);
++      }
+     }
+   }
+ 
+@@ -1211,7 +1230,10 @@ TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
+       host->GetPlainTextPainter());
+ 
+   // Scale text metrics if enabled
+-  if (RuntimeEnabledFeatures::FingerprintingCanvasMeasureTextNoiseEnabled()) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint) &&
++      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
+     if (HostAsOffscreenCanvas()) {
+       if (auto* window = DynamicTo<LocalDOMWindow>(GetTopExecutionContext())) {
+         if (window->GetFrame() && window->GetFrame()->GetDocument())
+diff --git a/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc b/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
+index 8b474a1..1fada36 100644
+--- a/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
++++ b/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
+@@ -4,9 +4,15 @@
+ 
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ 
++#include <functional>
++#include <string>
++#include <unordered_set>
++#include <vector>
++#include "base/command_line.h"
+ #include "base/rand_util.h"
+ #include "base/logging.h"
+ #include "base/numerics/checked_math.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+ #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_context.h"
+@@ -119,154 +125,103 @@ void StaticBitmapImage::DrawHelper(cc::PaintCanvas* canvas,
+                         ToSkiaRectConstraint(draw_options.clamping_mode));
+ }
+ 
+-// set the component to maximum-delta if it is >= maximum, or add to existing color component (color + delta)
+-#define shuffleComponent(color, max, delta) ( (color) >= (max) ? ((max)-(delta)) : ((color)+(delta)) )
++namespace {
+ 
+-#define writable_addr(T, p, stride, x, y) (T*)((const char *)p + y * stride + x * sizeof(T))
++uint64_t SplitMix64(uint64_t z) {
++  z += 0x9e3779b97f4a7c15ULL;
++  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++  return z ^ (z >> 31);
++}
+ 
+-void StaticBitmapImage::ShuffleSubchannelColorData(const void *addr, const SkImageInfo& info, int srcX, int srcY) {
+-  auto w = info.width() - srcX, h = info.height() - srcY;
++// True if neighbour |n| is present (alpha != 0) and differs from |p| in alpha
++// or in the RGB bits above the least significant bit.
++bool DiffersFromNeighbour(const uint8_t* p, const uint8_t* n) {
++  if (n[3] == 0) {
++    return false;
++  }
++  return ((p[0] ^ n[0]) & 0xFE) || ((p[1] ^ n[1]) & 0xFE) ||
++         ((p[2] ^ n[2]) & 0xFE) || p[3] != n[3];
++}
+ 
++}  // namespace
++
++// Deterministic canvas noise for --fingerprint: sets the RGB least significant
++// bits of a seed-selected 1-in-8 subset of opaque, non-black/white edge pixels.
++// - Only 8-bit RGBA buffers (unpremultiplied or opaque) are touched, with an
++//   explicit 4-byte layout and |info.minRowBytes()| stride.
++// - Selection uses the absolute canvas coordinates (x + srcX, y + srcY), and
++//   eligibility only alpha and the RGB bits above the LSB, so applying the
++//   noise twice gives the same bytes and uniform images stay byte-identical.
++// - Neighbours outside the buffer or with alpha 0 count as absent, so the
++//   zero-initialized out-of-canvas part of an oversized getImageData behaves
++//   like the canvas edge.
++void StaticBitmapImage::ShuffleSubchannelColorData(const void* addr,
++                                                   const SkImageInfo& info,
++                                                   int srcX,
++                                                   int srcY) {
++  const int w = info.width();
++  const int h = info.height();
+   // skip tiny images; info.width()/height() can also be 0
+-  if ((w < 8) || (h < 8)) {
++  if (!addr || w < 8 || h < 8) {
+     return;
+   }
+-
+-  // generate the first random number here
+-  double shuffleX = base::RandDouble();
+-
+-  // cap maximum pixels to change
+-  auto pixels = (w + h) / 128;
+-  if (pixels > 10) {
+-    pixels = 10;
+-  } else if (pixels < 2) {
+-    pixels = 2;
++  if (info.colorType() != kRGBA_8888_SkColorType ||
++      (info.alphaType() != kUnpremul_SkAlphaType &&
++       info.alphaType() != kOpaque_SkAlphaType)) {
++    return;
+   }
+ 
+-  auto colorType = info.colorType();
+-  auto fRowBytes = info.minRowBytes(); // stride
+-
+-  DLOG(INFO) << "BRM: ShuffleSubchannelColorData() w=" << w << " h=" << h << " colorType=" << colorType << " fRowBytes=" << fRowBytes;
+-
+-  // second random number (for y/height)
+-  double shuffleY = base::RandDouble();
+-
+-  // calculate random coordinates using bisection
+-  auto currentW = w, currentH = h;
+-  for(;pixels >= 0; pixels--) {
+-    int x = currentW * shuffleX, y = currentH * shuffleY;
+-
+-    // calculate randomisation amounts for each RGB component
+-    uint8_t shuffleR = base::RandIntInclusive(0, 4);
+-    uint8_t shuffleG = (shuffleR + x) % 4;
+-    uint8_t shuffleB = (shuffleG + y) % 4;
+-
+-    // manipulate pixel data to slightly change the R, G, B components
+-    switch (colorType) {
+-      case kAlpha_8_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint8_t, addr, fRowBytes, x, y);
+-         auto r = SkColorGetR(*pixel), g = SkColorGetG(*pixel), b = SkColorGetB(*pixel), a = SkColorGetA(*pixel);
+-
+-         r = shuffleComponent(r, UINT8_MAX-1, shuffleR);
+-         g = shuffleComponent(g, UINT8_MAX-1, shuffleG);
+-         b = shuffleComponent(b, UINT8_MAX-1, shuffleB);
+-         // alpha is left unchanged
+-
+-         *pixel = SkColorSetARGB(a, r, g, b);
+-      }
+-      break;
+-      case kGray_8_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint8_t, addr, fRowBytes, x, y);
+-         *pixel = shuffleComponent(*pixel, UINT8_MAX-1, shuffleB);
+-      }
+-      break;
+-      case kRGB_565_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint16_t, addr, fRowBytes, x, y);
+-         unsigned    r = SkPacked16ToR32(*pixel);
+-         unsigned    g = SkPacked16ToG32(*pixel);
+-         unsigned    b = SkPacked16ToB32(*pixel);
+-
+-         r = shuffleComponent(r, 31, shuffleR);
+-         g = shuffleComponent(g, 63, shuffleG);
+-         b = shuffleComponent(b, 31, shuffleB);
+-
+-         unsigned r16 = (r & SK_R16_MASK) << SK_R16_SHIFT;
+-         unsigned g16 = (g & SK_G16_MASK) << SK_G16_SHIFT;
+-         unsigned b16 = (b & SK_B16_MASK) << SK_B16_SHIFT;
+-
+-         *pixel = r16 | g16 | b16;
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kFingerprint) ||
++      (command_line->HasSwitch(switches::kDisableSpoofing) &&
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing)
++               .find("canvas") != std::string::npos)) {
++    return;
++  }
++  const uint64_t key = SplitMix64(std::hash<std::string>{}(
++      command_line->GetSwitchValueASCII(switches::kFingerprint) +
++      "canvas-pixels"));
++
++  const size_t row_bytes = info.minRowBytes();
++  uint8_t* pixels = static_cast<uint8_t*>(const_cast<void*>(addr));
++
++  for (int y = 0; y < h; ++y) {
++    uint8_t* row = pixels + static_cast<size_t>(y) * row_bytes;
++    uint8_t* next_row = (y + 1 < h) ? row + row_bytes : nullptr;
++    const uint64_t key_y = key ^ static_cast<uint64_t>(static_cast<uint32_t>(
++                                     static_cast<int64_t>(y) + srcY));
++    for (int x = 0; x < w; ++x) {
++      const uint64_t z = SplitMix64(
++          key_y ^ (static_cast<uint64_t>(static_cast<uint32_t>(
++                       static_cast<int64_t>(x) + srcX))
++                   << 32));
++      if ((z & 7) != 0) {
++        continue;
+       }
+-      break;
+-      case kARGB_4444_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint16_t, addr, fRowBytes, x, y);
+-         auto a = SkGetPackedA4444(*pixel), r = SkGetPackedR4444(*pixel), g = SkGetPackedG4444(*pixel), b = SkGetPackedB4444(*pixel);
+-
+-         r = shuffleComponent(r, 15, shuffleR);
+-         g = shuffleComponent(g, 15, shuffleG);
+-         b = shuffleComponent(b, 15, shuffleB);
+-         // alpha is left unchanged
+-
+-         unsigned a4 = (a & 0xF) << SK_A4444_SHIFT;
+-         unsigned r4 = (r & 0xF) << SK_R4444_SHIFT;
+-         unsigned g4 = (g & 0xF) << SK_G4444_SHIFT;
+-         unsigned b4 = (b & 0xF) << SK_B4444_SHIFT;
+-
+-         *pixel = r4 | b4 | g4 | a4;
++      uint8_t* p = row + static_cast<size_t>(x) * 4;
++      if (p[3] != 255) {
++        continue;
+       }
+-      break;
+-      case kRGBA_8888_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint32_t, addr, fRowBytes, x, y);
+-         auto a = SkGetPackedA32(*pixel), r = SkGetPackedR32(*pixel), g = SkGetPackedG32(*pixel), b = SkGetPackedB32(*pixel);
+-
+-         r = shuffleComponent(r, UINT8_MAX-1, shuffleR);
+-         g = shuffleComponent(g, UINT8_MAX-1, shuffleG);
+-         b = shuffleComponent(b, UINT8_MAX-1, shuffleB);
+-         // alpha is left unchanged
+-
+-         *pixel = (a << SK_A32_SHIFT) | (r << SK_R32_SHIFT) |
+-                  (g << SK_G32_SHIFT) | (b << SK_B32_SHIFT);
++      const int r = p[0] & 0xFE;
++      const int g = p[1] & 0xFE;
++      const int b = p[2] & 0xFE;
++      if ((r == 0 && g == 0 && b == 0) ||
++          (r == 0xFE && g == 0xFE && b == 0xFE)) {
++        continue;
+       }
+-      break;
+-      case kBGRA_8888_SkColorType:
+-      {
+-         auto *pixel = writable_addr(uint32_t, addr, fRowBytes, x, y);
+-         auto a = SkGetPackedA32(*pixel), b = SkGetPackedR32(*pixel), g = SkGetPackedG32(*pixel), r = SkGetPackedB32(*pixel);
+-
+-         r = shuffleComponent(r, UINT8_MAX-1, shuffleR);
+-         g = shuffleComponent(g, UINT8_MAX-1, shuffleG);
+-         b = shuffleComponent(b, UINT8_MAX-1, shuffleB);
+-         // alpha is left unchanged
+-
+-         *pixel = (a << SK_BGRA_A32_SHIFT) | (r << SK_BGRA_R32_SHIFT) |
+-                  (g << SK_BGRA_G32_SHIFT) | (b << SK_BGRA_B32_SHIFT);
++      const bool edge =
++          (x + 1 < w && DiffersFromNeighbour(p, p + 4)) ||
++          (next_row &&
++           DiffersFromNeighbour(p, next_row + static_cast<size_t>(x) * 4));
++      if (!edge) {
++        continue;
+       }
+-      break;
+-      default:
+-         // the remaining formats are not expected to be used in Chromium
+-         LOG(WARNING) << "BRM: ShuffleSubchannelColorData(): Ignoring pixel format";
+-         return;
+-    }
+-
+-    // keep bisecting or reset current width/height as needed
+-    if (x == 0) {
+-       currentW = w;
+-    } else {
+-       currentW = x;
+-    }
+-    if (y == 0) {
+-       currentH = h;
+-    } else {
+-       currentH = y;
++      p[0] = static_cast<uint8_t>((p[0] & 0xFE) | ((z >> 8) & 1));
++      p[1] = static_cast<uint8_t>((p[1] & 0xFE) | ((z >> 9) & 1));
++      p[2] = static_cast<uint8_t>((p[2] & 0xFE) | ((z >> 10) & 1));
+     }
+   }
+ }
+ 
+-#undef writable_addr
+-#undef shuffleComponent
+-
+ }  // namespace blink
